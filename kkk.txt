@@ -1,0 +1,1140 @@
+
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.preprocessing import StandardScaler
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+import copy
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import TensorDataset, DataLoader
+import torch.optim as optim
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+
+
+# 常量定义
+DATASET_PATH = "D:\\桌面\\new2_1s_Center_freqs_and_vibration_level_bands_result.csv"
+VAL_SIZE = 0.1
+RANDOM_STATE = 43
+LOW_FREQ_THRESHOLD = 6
+BATCH_SIZE = 32
+LOW_FREQ_BOOST = 2.0
+LOW_FREQ_LR = 0.001
+HIGH_FREQ_LR = 0.0005
+ADAPTIVE_LR = 0.01
+WEIGHT_DECAY = 1e-5
+LR_FACTOR = 0.5
+LEARNING_RATE = 0.0005
+LR_PATIENCE = 10
+NUM_EPOCHS = 100
+PATIENCE = 15
+L2_LAMBDA = 1e-4
+
+# --- 中心频率 ---
+# 10-8000Hz, 30 个频带
+freq_bands = [
+    10, 12.5, 16, 20, 25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200, 250,
+    315, 400, 500, 630, 800, 1000, 1250, 1600, 2000, 2500, 3150, 4000,
+    5000, 6300, 8000
+]
+
+# 确保 freq_bands 的长度与模型输出维度 (num_tasks) 匹配
+num_bands = len(freq_bands)
+
+# --- Matplotlib 全局设置 ---
+plt.rcParams['font.sans-serif'] = ['SimHei']  # 指定默认字体为黑体
+plt.rcParams['axes.unicode_minus'] = False    # 解决保存图像是负号'-'显示为方块的问题
+
+
+# 1.数据加载与预处理模块
+def load_data(dataset_path):
+    """
+    加载数据集
+    :param dataset_path:数据集文件的路径
+    :return  dataset_path 路径下的 CSV 文件的DataFrame
+    """
+    return pd.read_csv(dataset_path)
+
+
+def preprocess_data(data, test_condition):
+    """
+    预处理数据，包括数据清洗和划分数据集，注意防止数据泄露，为留一工况交叉验证生成预处理后的数据划分。
+    每次yield一组完整的、经过清洗、标准化处理的训练、验证、测试张量及标准化器。
+    """
+    print("数据预处理开始...")
+
+    # 创建一个新的DataFrame，只保留需要的列
+    new_data = pd.concat([data.iloc[:, 1:3], data.iloc[:, 3:]], axis=1)
+    data = new_data
+
+    print(f"只保留需要的列后的data的形状：{data.shape}")
+
+    # ①获取所有独特的工况 (speed, load) 对
+    unique_conditions = data[['speed', 'load']].drop_duplicates().values.tolist()
+    unique_conditions = [tuple(condition) for condition in unique_conditions]  # 转换为元组列表，方便比较
+
+    if len(unique_conditions) < 3:
+        print("警告：数据中的独立工况少于3个，无法同时划分训练、验证和测试集。")
+        return  # 提前退出
+
+    print(f"总共发现 {len(unique_conditions)} 个独立工况: {unique_conditions}")
+
+    # ②外层循环：依次选择一个工况作为测试集
+    for test_condition in unique_conditions:
+        print(f"\n--- 外层循环：指定测试工况为 {test_condition} ---")
+
+        # 分离测试集
+        test_mask = (data['speed'] == test_condition[0]) & (data['load'] == test_condition[1])
+        # 使用.copy()避免后续操作影响原始data或其它切片
+        test_data_split = data[test_mask].copy()
+        train_val_data = data[~test_mask].copy()  # 剩余数据作为训练+验证候选集
+
+        print(f"测试工况 {test_condition} 的样本数: {len(test_data_split)}")
+        print(f"用于划分训练+验证的剩余工况样本总数: {len(train_val_data)}")
+
+        # ③获取剩余数据中的独立工况
+        train_val_conditions = train_val_data[['speed', 'load']].drop_duplicates().values.tolist()
+        train_val_conditions = [tuple(condition) for condition in train_val_conditions]
+
+        if not train_val_conditions:  # 如果只有一个工况，则无法进行内层划分
+            print(f"警告：移除测试工况 {test_condition} 后没有剩余工况可用于训练/验证。跳过此外层循环。")
+            continue
+
+        # ④内层循环：在剩余工况中，依次选择一个工况作为验证集
+        for val_condition in train_val_conditions:
+            print(f"  --- 内层循环：指定验证工况为 {val_condition} ---")
+
+            # 从 train_val_data 中分离验证集
+            val_mask = (train_val_data['speed'] == val_condition[0]) & (train_val_data['load'] == val_condition[1])
+
+            # 使用.copy()避免后续操作影响原始data或其它切片
+            val_data_split = train_val_data[val_mask].copy()
+
+            # train_val_data 中排除验证集后即为训练集
+            train_data_split = train_val_data[~val_mask].copy()
+
+            print(f"验证工况 {val_condition} 的样本数: {len(val_data_split)}")
+            print(f"训练集包含的工况数: {len(train_val_conditions) - 1}, 样本数: {len(train_data_split)}")
+
+            # ⑤对当前 **训练集** 进行数据清洗
+            print("对当前训练集进行数据清洗...")
+
+            # 5.1 缺失值处理 (只处理训练集)
+            initial_train_rows = len(train_data_split)
+            train_data_cleaned = train_data_split.dropna()
+            rows_dropped = initial_train_rows - len(train_data_cleaned)
+            if rows_dropped > 0:
+                print(f"  训练集缺失值处理：移除了 {rows_dropped} 行。")
+            print(f"  训练数据形状(缺失值处理后): {train_data_cleaned.shape}")
+
+            # 5.2 异常值处理 (只处理训练集，按工况分组)
+            if not train_data_cleaned.empty:
+                # 确保 target_columns 存在于 train_data_cleaned 中
+                valid_target_columns = [col for col in train_data_cleaned.iloc[:, 2:] if col in train_data_cleaned.columns]
+                if len(valid_target_columns) < len(train_data_cleaned.iloc[:, 2:]):
+                    print(f"  警告：部分目标列不在清洗后的训练数据中。可用目标列：{valid_target_columns}")
+
+                # 确保至少有一个目标列可供处理
+                if valid_target_columns and len(train_data_cleaned.columns) > 2:
+                    # 创建一个临时函数来传递 target_columns
+                    def apply_process_outliers(group):
+                        return process_outliers_internal(group, valid_target_columns)
+
+                    def process_outliers_internal(group, targets):
+                        group = group.copy()
+                        for col in targets:
+                            Q1 = group[col].quantile(0.25)
+                            Q3 = group[col].quantile(0.75)
+                            IQR = Q3 - Q1
+                            lower_bound = Q1 - 1.5 * IQR
+                            upper_bound = Q3 + 1.5 * IQR
+                            median = group[col].median()
+                            # 检查中位数是否有效 (非 NaN)
+                            if pd.notna(median):
+                                group[col] = group[col].where((group[col] >= lower_bound) & (group[col] <= upper_bound),
+                                                              median)
+                            else:
+                                # 如果中位数是NaN (可能整个组都是NaN)，则不替换
+                                print(
+                                    f"    警告：工况 {group['speed'].iloc[0]},{group['load'].iloc[0]} 列 {col} 的中位数为NaN，跳过异常值替换。")
+                        return group
+
+                    train_data_cleaned = train_data_cleaned.groupby(["speed", "load"], group_keys=False).apply(
+                        apply_process_outliers)
+                    print(f"  训练数据形状(异常值处理后)：{train_data_cleaned.shape}")
+
+                else:
+                    print("  训练数据中无有效目标列或列数不足，跳过异常值处理。")
+
+                # 检查清洗后训练集是否为空
+            if train_data_cleaned.empty:
+                print(
+                    f"  警告：当前划分下训练集在清洗后为空 (测试: {test_condition}, 验证: {val_condition})。跳过此组合。")
+                continue
+
+            # ⑥提取特征 (X) 和标签 (y)，从 清洗后的训练集 和 未清洗的验证/测试集 中提取
+            try:
+                X_train_cleaned = train_data_cleaned.iloc[:, :2].values
+                y_train_cleaned = train_data_cleaned.iloc[:, 2:].values
+
+                X_val = val_data_split.iloc[:, :2].values
+                y_val = val_data_split.iloc[:, 2:].values
+
+                X_test = test_data_split.iloc[:, :2].values
+                y_test = test_data_split.iloc[:, 2:].values
+            except KeyError as e:
+                print(f"  错误：列索引超出范围: {e}，请确认数据列数足够")
+                continue
+
+            # ⑦ 标准化特征 (X)
+            scaler = StandardScaler()
+            # 仅在清洗后的训练特征上拟合
+            X_train_scaled = scaler.fit_transform(X_train_cleaned)
+            # 应用到验证集和测试集特征
+            X_val_scaled = scaler.transform(X_val)
+            X_test_scaled = scaler.transform(X_test)
+
+            # ⑧ 转换为 PyTorch 张量
+            X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32)
+            y_train_tensor = torch.tensor(y_train_cleaned, dtype=torch.float32)  # y_train 对应清洗后的
+            X_val_tensor = torch.tensor(X_val_scaled, dtype=torch.float32)
+            y_val_tensor = torch.tensor(y_val, dtype=torch.float32)  # y_val 对应原始 val
+            X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32)
+            y_test_tensor = torch.tensor(y_test, dtype=torch.float32)  # y_test 对应原始 test
+
+            # ⑨ yield 当前处理好的数据划分
+            yield (X_train_tensor, y_train_tensor,
+                   X_val_tensor, y_val_tensor,
+                   X_test_tensor, y_test_tensor,
+                   scaler, test_condition, val_condition)
+
+        print("\n数据预处理生成器完成所有划分。")
+
+
+def create_dataloaders(X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, X_val_tensor, y_val_tensor, batch_size=BATCH_SIZE):
+    """创建训练集、测试集和验证集的数据加载器."""
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+    val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    return train_loader, test_loader, val_loader
+
+
+# 2.模型定义模块
+class AttentionLayer(nn.Module):
+    """注意力层."""
+    def __init__(self, input_dim):
+        super(AttentionLayer, self).__init__()
+        self.attention_weights = nn.Linear(input_dim, input_dim)
+
+    def forward(self, x):
+        weights = torch.softmax(self.attention_weights(x), dim=1)
+        return x * weights
+
+
+class FrequencyAwareProbabilisticMultiTaskModel(nn.Module):
+    """频带感知概率输出多任务模型."""
+    def __init__(self, input_dim, output_dim, low_freq_threshold=LOW_FREQ_THRESHOLD):
+        super(FrequencyAwareProbabilisticMultiTaskModel, self).__init__()
+        if low_freq_threshold >= output_dim or low_freq_threshold < 0:
+            raise ValueError("low_freq_threshold must be between 0 and output_dim-1")
+
+        self.low_freq_tasks = low_freq_threshold
+        self.high_freq_tasks = output_dim - low_freq_threshold
+        self.total_tasks = output_dim
+
+        # 共享特征提取层
+        self.shared_feature_extractor = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
+        self.shared_attention = AttentionLayer(256)
+
+        # 低频特化特征提取层
+        self.low_freq_extractor = nn.Sequential(
+            nn.Linear(256, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, 128),
+            nn.LayerNorm(128),
+            nn.ReLU()
+        )
+        self.low_freq_attention = AttentionLayer(128)
+
+        # 高频特化特征提取层
+        self.high_freq_extractor = nn.Sequential(
+            nn.Linear(256, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, 128),
+            nn.LayerNorm(128),
+            nn.ReLU()
+        )
+        self.high_freq_attention = AttentionLayer(128)
+
+        # 低频任务特定头
+        self.low_freq_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(128, 64),
+                nn.LayerNorm(64),
+                nn.ReLU(),
+                nn.Linear(64, 32),
+                nn.ReLU(),
+                nn.Linear(32, 2)  # 输出两个值：均值和标准差
+            ) for _ in range(self.low_freq_tasks)
+        ])
+
+        # 高频任务特定头
+        self.high_freq_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(128, 64),
+                nn.LayerNorm(64),
+                nn.ReLU(),
+                nn.Linear(64, 2)
+            ) for _ in range(self.high_freq_tasks)
+        ])
+
+    def forward(self, x):
+        # 共享特征提取
+        shared_features = self.shared_feature_extractor(x)
+        # 对共享特征应用注意力
+        shared_features = self.shared_attention(shared_features)
+
+        # 低频和高频特征提取
+        low_freq_features = self.low_freq_extractor(shared_features)
+        high_freq_features = self.high_freq_extractor(shared_features)
+
+        # 对低频和高频特征应用注意力
+        low_freq_features = self.low_freq_attention(low_freq_features)
+        high_freq_features = self.high_freq_attention(high_freq_features)
+
+        # 处理头
+        all_means = []
+        all_stds = []
+
+        # 低频输出
+        for i in range(self.low_freq_tasks):
+            head_output = self.low_freq_heads[i](low_freq_features)  # Shape: (batch_size, 2)
+            mean = head_output[:, 0].unsqueeze(1)  # Shape: (batch_size, 1)
+            std_raw = head_output[:, 1].unsqueeze(1)  # Shape: (batch_size, 1)
+            # 应用 softplus 以确保 std > 0，添加 epsilon 以保持稳定性
+            std = F.softplus(std_raw) + 1e-6
+            all_means.append(mean)
+            all_stds.append(std)
+
+        # 高频输出
+        for i in range(self.high_freq_tasks):
+            head_output = self.high_freq_heads[i](high_freq_features)  # Shape: (batch_size, 2)
+            mean = head_output[:, 0].unsqueeze(1)  # Shape: (batch_size, 1)
+            std_raw = head_output[:, 1].unsqueeze(1)  # Shape: (batch_size, 1)
+            # 应用 softplus 以确保 std > 0，添加 epsilon 以保持稳定性
+            std = F.softplus(std_raw) + 1e-6
+            all_means.append(mean)
+            all_stds.append(std)
+
+        # 合并输出
+        means_tensor = torch.cat(all_means, dim=1)  # Shape: (batch_size, total_tasks)
+        stds_tensor = torch.cat(all_stds, dim=1)  # Shape: (batch_size, total_tasks)
+
+        return means_tensor, stds_tensor
+
+
+# 3.损失函数定义模块,高斯负对数似然损失
+# 此损失函数计算 NLL，假设目标 'y' 来自高斯分布，预测平均值为 'mu' 和标准差 'sigma'。
+class GaussianNLLLoss(nn.Module):
+    """高斯负对数似然损失"""
+    def __init__(self, reduction="mean"):
+        super(GaussianNLLLoss, self).__init__()
+        self.reduction = reduction
+
+    def forward(self, mu, sigma, target):
+        """
+        计算高斯负对数似然损失
+        :param mu:预测的平均值（batch_size, num_tasks）
+        :param sigma:预测的标准差（batch_size, num_tasks）
+        :param target:真实值（batch_size, num_tasks）
+        :return:Tensor,计算出的NLL损失
+        """
+        # 要确保sigma是正的
+        log_sigma = torch.log(sigma)
+        term1 = 0.5 * torch.log(torch.tensor(2.0 * math.pi))  # 常数项log(sqrt(2pi))
+        term2 = log_sigma
+        term3 = 0.5 * ((target - mu) / sigma)**2  # (y - mu)^2 / (2 * sigma^2)
+
+        nll_elementwise = term1 + term2 + term3
+
+        # 应用reduction
+        if self.reduction == 'mean':
+            return torch.mean(nll_elementwise)
+        elif self.reduction == 'sum':
+            return torch.sum(nll_elementwise)
+        else:  # 'none'
+            return nll_elementwise
+
+
+class FrequencyAwareAdaptiveWeightLoss(nn.Module):
+    """频带感知自适应权重损失函数.它是用来进行损失权重调整的"""
+    def __init__(self, num_tasks, low_freq_boost=LOW_FREQ_BOOST, low_freq_threshold=LOW_FREQ_THRESHOLD):
+        super(FrequencyAwareAdaptiveWeightLoss, self).__init__()
+        self.log_vars = nn.Parameter(torch.zeros(num_tasks))  # 可学习的对数方差参数
+        self.low_freq_boost = low_freq_boost
+        self.low_freq_threshold = low_freq_threshold
+        self.task_weights = torch.ones(num_tasks) / num_tasks
+
+    def forward(self, losses):
+        weights = torch.exp(-self.log_vars)  # 根据对数方差计算权重
+        boosted_weights = weights.clone()
+        boosted_weights[:self.low_freq_threshold] *= self.low_freq_boost  # 低频任务权重增强
+        self.task_weights = boosted_weights.detach()
+        weighted_losses = boosted_weights * losses + 0.5 * self.log_vars  # 最终损失公式
+        return weighted_losses.mean(), boosted_weights
+
+# 4.模型训练与验证模块
+def prepare_optimizer_and_loss(model, output_dim, device):
+    """为频带感知概率输出多任务模型准备优化器、学习率调度器和损失函数"""
+    print("准备优化器和损失函数...")
+
+    # 1.自适应权重损失函数，这个函数接收每个任务的损失，并计算加权总损失和正则项
+    adaptive_loss_func = FrequencyAwareAdaptiveWeightLoss(num_tasks=output_dim, low_freq_boost=LOW_FREQ_BOOST,
+                                                          low_freq_threshold=LOW_FREQ_THRESHOLD).to(device)
+    print(f"- 自适应损失函数 (FrequencyAwareAdaptiveWeightLoss) 创建成功，低频阈值: {LOW_FREQ_THRESHOLD}, 低频增强: {LOW_FREQ_BOOST}")
+
+    # 2.主损失函数（高斯负对数似然损失）
+    # 设置 reduction='none' 以便获取每个样本每个任务的损失值，这对于后续计算 per-task loss (在批次维度求平均) 并输入到 adaptive_loss_func 是必需的。
+    nll_loss_fn = GaussianNLLLoss(reduction='none').to(device)
+    print("  - 主损失函数 (GaussianNLLLoss, reduction='none') 创建成功。")
+
+    # 3.定义不同部分的参数组
+    try:
+        low_freq_params = list(model.low_freq_extractor.parameters()) + \
+                          [p for head in model.low_freq_heads for p in head.parameters()]  # 简化获取低频头参数
+        high_freq_params = list(model.high_freq_extractor.parameters()) + \
+                           [p for head in model.high_freq_heads for p in head.parameters()]  # 简化获取高频头参数
+        shared_params = list(model.shared_feature_extractor.parameters()) + \
+                        list(model.shared_attention.parameters()) + \
+                        list(model.low_freq_attention.parameters()) + \
+                        list(model.high_freq_attention.parameters())  # 将所有注意力层归入共享参数
+
+        # 添加adaptive_loss_func的可学习参数（log_vars）到优化器
+        adaptive_loss_params = list(adaptive_loss_func.parameters())
+
+        print(f"  - 参数分组：共享层 {len(shared_params)} 个参数张量，"
+              f"低频特定层 {len(low_freq_params)} 个，"
+              f"高频特定层 {len(high_freq_params)} 个，"
+              f"自适应损失 {len(adaptive_loss_params)} 个。")
+
+    except AttributeError as e:
+        print(f"错误：访问模型参数时出错: {e}。请检查模型结构是否与参数分组代码匹配。")
+        raise  # 重新抛出异常，因为这是关键错误
+
+    # 4.创建优化器（Adam），为不同参数组设置不同的学习率
+    optimizer = optim.Adam([
+        {'params': shared_params, 'lr': LEARNING_RATE},  # 共享层使用基础学习率
+        {'params': low_freq_params, 'lr': LOW_FREQ_LR},  # 低频层使用特定学习率
+        {'params': high_freq_params, 'lr': HIGH_FREQ_LR},  # 高频层使用特定学习率
+        {'params': adaptive_loss_params, 'lr': ADAPTIVE_LR}  # 自适应损失参数使用特定学习率
+    ], weight_decay=WEIGHT_DECAY)  # 全局应用 weight decay
+    print(
+        f"  - Adam 优化器创建成功。基础 LR: {LEARNING_RATE}, 低频 LR: {LOW_FREQ_LR}, 高频 LR: {HIGH_FREQ_LR}, 自适应损失 LR: {ADAPTIVE_LR}, Weight Decay: {WEIGHT_DECAY}")
+
+    # 5.创建学习率调度器
+    # 监控验证集损失，当不再改善时降低学习率
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode='min',  # 监控指标越小越好 (通常是验证集损失)
+        factor=LR_FACTOR,  # 学习率衰减因子
+        patience=LR_PATIENCE,  # 容忍多少个 epoch 没有改善
+        verbose=True  # 触发时打印信息
+    )
+    print(f"  - ReduceLROnPlateau 学习率调度器创建成功。Factor: {LR_FACTOR}, Patience: {LR_PATIENCE}")
+
+    print("优化器和损失函数准备完毕。\n")
+    return optimizer, scheduler, adaptive_loss_func, nll_loss_fn
+
+
+def train_epoch(model, train_loader, optimizer, adaptive_loss_func, nll_loss_fn, l2_lambda, device):
+    """
+    训练一个epoch
+    :param model:频带感知概率输出多任务模型实例
+    :param train_loader:训练数据加载器
+    :param optimizer:优化器实例
+    :param adaptive_loss_func:频带感知自适应权重损失函数实例
+    :param nll_loss_fn:高斯负对数似然损失函数实例 (reduction应为'none'或能在内部处理)
+    :param l2_lambda:L2 正则化系数
+    :param device:计算设备
+    :return:float: 当前 epoch 的平均训练损失
+    """
+    model.train()  # 设置模型为训练模式
+    train_running_loss = 0.0
+    total_batches = len(train_loader)
+
+    for batch_idx, (inputs, targets) in enumerate(train_loader):
+        inputs, targets = inputs.to(device), targets.to(device)
+
+        # 1.梯度清零
+        optimizer.zero_grad()
+
+        # 2.前向传播
+        # 模型输出预测的均值（means）和标准差（stds）
+        predicted_means, predicted_stds = model(inputs)
+
+        # 3.计算主损失
+        # 计算每个样本每个任务的NLL损失（需要nll_loss_fn的reduction="none"）
+        # 确保传入的nll_loss_fn的reduction不是"mean"或"sum"
+        nll_loss_elementwise = nll_loss_fn(predicted_means, predicted_stds, targets)
+
+        # 计算每个任务的平均NLL损失（在batch维度上求平均）
+        nll_loss_per_task = torch.mean(nll_loss_elementwise, dim=0)  # shape:(num_tasks,)
+
+        # 4.应用自适应权重损失函数
+        # 输入每个任务的平均NLL损失，得到加权后的总损失和任务权重
+        adaptive_weighted_loss, task_weights = adaptive_loss_func(nll_loss_per_task)
+
+        # 5.计算L2正则化项
+        l2_reg = torch.tensor(0., device=device)
+        # 注意力层（低正则化）
+        for param in model.shared_attention.parameters():
+            if param.requires_grad:
+                l2_reg += 0.1 * l2_lambda * torch.norm(param, p=2)  # 使用 p=2 计算 L2 范数
+
+        # 共享特征提取层（全量正则化）
+        for param in model.shared_feature_extractor.parameters():
+            if param.requires_grad:
+                l2_reg += l2_lambda * torch.norm(param, p=2)
+
+        # 低频特征提取层（低正则化）
+        for param in model.low_freq_extractor.parameters():
+            if param.requires_grad:
+                l2_reg += 0.1 * l2_lambda * torch.norm(param, p=2)
+
+        # 高频特征提取层（全量正则化）
+        for param in model.high_freq_extractor.parameters():
+            if param.requires_grad:
+                l2_reg += l2_lambda * torch.norm(param, p=2)
+
+        # 任务头部（全量正则化）
+        # 低频头
+        for head in model.low_freq_heads:
+            for param in head.parameters():
+                if param.requires_grad:
+                    l2_reg += l2_lambda * torch.norm(param, p=2)
+        # 高频头
+        for head in model.high_freq_heads:
+            for param in head.parameters():
+                if param.requires_grad:
+                    l2_reg += l2_lambda * torch.norm(param, p=2)
+
+        # 6.计算总损失
+        total_loss = adaptive_weighted_loss + l2_reg
+
+        # 7.反向传播
+        total_loss.backward()
+
+        # 8.更新优化器
+        optimizer.step()
+
+        # 9.累加批次损失
+        train_running_loss += total_loss.item()
+
+    # 计算并返回epoch的平均损失
+    average_epoch_loss = train_running_loss / total_batches
+    return average_epoch_loss
+
+
+def validate_epoch(model, val_loader, nll_loss_fn, device):
+    """
+    验证一个epoch
+    :param model:频带感知概率输出多任务模型实例
+    :param val_loader:验证数据加载器
+    :param nll_loss_fn:高斯负对数似然损失函数实例 (其 reduction 参数会被忽略，内部使用 'mean')
+    :param device:计算设备
+    :return:- float: 当前 epoch 的平均验证 NLL 损失.
+            - np.ndarray: 每个任务的平均验证 NLL 损失 (shape: [num_tasks,]).
+    """
+    model.eval()  # 设置模型为评估模式
+    val_running_loss = 0.0
+    all_nll_losses_per_task = []  # 用于存储每个批次中每个任务的平均损失
+    total_batches = len(val_loader)
+
+    with torch.no_grad():  # 在此块内禁用梯度计算
+        for batch_idx, (inputs, targets) in enumerate(val_loader):
+            inputs, targets = inputs.to(device), targets.to(device)
+
+            # 1.前向传播
+            predicted_means, predicted_stds = model(inputs)
+
+            # 2.计算验证损失（使用NLL Loss）
+            # a.计算元素级的 NLL 损失 (需要 nll_loss_fn 内部能处理或设置为 reduction='none')
+            # 我们再次实例化一个内部使用的，确保 reduction='none'
+            nll_loss_calculator_elementwise = GaussianNLLLoss(reduction='none').to(device)
+            nll_loss_elementwise = nll_loss_calculator_elementwise(predicted_means, predicted_stds, targets)
+
+            # b.计算当前批次的平均 NLL 损失 (在所有样本和所有任务上取平均)
+            batch_loss = torch.mean(nll_loss_elementwise)
+            val_running_loss += batch_loss.item()
+
+            # c.计算当前批次每个任务的平均 NLL 损失 (在批次维度上求平均)
+            nll_loss_per_task_batch = torch.mean(nll_loss_elementwise, dim=0)  # Shape: (num_tasks,)
+            all_nll_losses_per_task.append(nll_loss_per_task_batch.cpu().numpy())
+
+    # 计算整个验证集的平均损失
+    average_val_loss = val_running_loss / total_batches
+
+    # 计算整个验证集上每个任务的平均损失
+    # 将列表中的 numpy 数组堆叠起来，然后在第一个维度（批次维度）上求平均
+    avg_nll_losses_per_task = np.mean(np.array(all_nll_losses_per_task), axis=0)
+
+    # 返回整个验证集的平均 NLL 损失 (average_val_loss) 和每个任务的平均 NLL 损失 (avg_nll_losses_per_task)。
+    # average_val_loss 是用于学习率调度器 (scheduler.step()) 和模型选择（例如早停）的主要指标。avg_nll_losses_per_task 可用于分析模型在不同频带上的表现。
+    return average_val_loss, avg_nll_losses_per_task
+
+
+def train_model(model, train_loader, val_loader, optimizer, scheduler, adaptive_loss_func, nll_loss_func, l2_lambda, num_epochs, patience, device):
+    """
+    训练频带感知概率输出多任务模型
+    :param model:要训练的模型实例
+    :param train_loader:训练数据加载器
+    :param val_loader:验证数据加载器
+    :param optimizer:优化器实例
+    :param scheduler:学习率调度器实例
+    :param adaptive_loss_func:自适应权重损失函数实例(用于 train_epoch)
+    :param nll_loss_func:高斯 NLL 损失函数实例(用于 train_epoch 和 validate_epoch)
+    :param l2_lambda:L2 正则化系数 (用于 train_epoch)
+    :param num_epochs:最大训练轮数
+    :param patience:早停的容忍轮数 (验证损失连续多少轮未改善则停止)
+    :param device:计算设备
+    :return: - list[float]: 每个 epoch 的平均训练损失列表。
+            - list[float]: 每个 epoch 的平均验证 NLL 损失列表。
+            - float: 训练过程中达到的最佳 (最小) 验证 NLL 损失。
+            - dict: 对应最佳验证损失的模型状态字典 (state_dict)。
+            - np.ndarray: 每个 epoch 每个任务的平均验证 NLL 损失 (形状: [num_epochs_run, num_tasks])。
+    """
+    train_losses = []
+    val_losses = []
+    all_per_task_val_losses = []  # 存储每个epoch的每个任务的验证损失
+    best_val_loss = float("inf")
+    best_model_weights = None
+    epochs_no_improve = 0
+
+    print(f"开始训练模型，共{num_epochs}个epochs，早停耐心设置为{patience}...")
+
+    for epoch in range(num_epochs):
+        # --- 训练阶段 ---
+        avg_train_loss = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            adaptive_loss_func,
+            nll_loss_func,  # NLL loss (reduction='none')
+            l2_lambda,
+            device
+        )
+        train_losses.append(avg_train_loss)
+
+        # --- 验证阶段 ---
+        avg_val_loss, avg_val_losses_per_task = validate_epoch(
+            model,
+            val_loader,
+            nll_loss_func,  # NLL loss (内部会用 reduction='none' 计算)
+            device
+        )
+        val_losses.append(avg_val_loss)
+        all_per_task_val_losses.append(avg_val_losses_per_task)
+
+        print(f"Epoch [{epoch + 1}/{num_epochs}], Train Loss: {avg_train_loss:.4f}, Val NLL Loss: {avg_val_loss:.4f}")
+
+        # --- 学习率调度 ---
+        # ReduceLROnPlateau 需要传入监控的指标
+        scheduler.step(avg_val_loss)
+
+        # --- 早停逻辑 ---
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            # 使用 copy.deepcopy 或 state_dict().copy() 来保存权重，避免引用问题
+            best_model_weights = copy.deepcopy(model.state_dict())
+            epochs_no_improve = 0
+            print(f"  Validation loss 改善，保存当前最佳模型。")
+        else:
+            epochs_no_improve += 1
+            print(f"  Validation loss 未改善 ({epochs_no_improve}/{patience}).")
+            if epochs_no_improve >= patience:
+                print(f"\n早停触发：验证损失连续 {patience} epochs 未改善。停止训练于 epoch {epoch + 1}。")
+                break
+
+    # 训练结束后加载最佳权重
+    if best_model_weights:
+        print(f"\n训练结束。加载验证损失最小 (NLL Loss: {best_val_loss:.4f}) 时的模型权重。")
+        model.load_state_dict(best_model_weights)
+    else:
+        print("\n警告：训练未完成或未能找到更优的模型权重。")
+
+    # 将收集到的每任务损失列表转换为 NumPy 数组
+    final_per_task_val_losses = np.array(all_per_task_val_losses)
+
+    return train_losses, val_losses, best_val_loss, best_model_weights, final_per_task_val_losses
+
+
+# 5.模型评估模块
+def evaluate_model(model, test_loader, nll_loss_func, device):
+    """
+    在测试集上评估模型
+    :param model:已训练好的模型实例 (通常已加载最佳权重)
+    :param test_loader:测试数据加载器
+    :param nll_loss_func:高斯负对数似然损失函数实例 (其 reduction 参数会被忽略)
+    :param device:计算设备
+    :return: - float: 测试集上的平均 NLL 损失。
+            - float: 测试集上基于预测均值的平均 MSE 损失。
+            - float: 测试集上基于预测均值的平均 MAE 损失。
+            - np.ndarray: 所有测试样本的真实标签值 (shape: [num_test_samples, num_tasks])。
+            - np.ndarray: 所有测试样本的预测均值 (shape: [num_test_samples, num_tasks])。
+            - np.ndarray: 所有测试样本的预测标准差 (shape: [num_test_samples, num_tasks])
+    """
+    model.eval()  # 设置模型为评估模式
+    total_nll_loss = 0.0
+    total_mse_loss = 0.0
+    total_mae_loss = 0.0
+    all_true_values = []
+    all_pred_means = []
+    all_pred_stds = []
+    total_batches = len(test_loader)
+
+    # 用于计算NLL的实例（确保 reduction='mean' 或在内部处理）
+    nll_calculator = GaussianNLLLoss(reduction='mean').to(device)
+
+    print("开始在测试集上评估模型...")
+
+    with torch.no_grad():  # 禁用梯度计算
+        for batch_idx, (inputs, targets) in enumerate(test_loader):
+            inputs, targets = inputs.to(device), targets.to(device)
+
+            # 1. 前向传播
+            predicted_means, predicted_stds = model(inputs)
+
+            # 2.计算损失指标
+            # a. NLL Loss(批次平均)
+            batch_nll_loss = nll_calculator(predicted_means, predicted_stds, targets)
+            total_nll_loss += batch_nll_loss.item()
+
+            # b. MSE Loss(基于预测均值)
+            batch_mse_loss = F.mse_loss(predicted_means, targets)  # 使用 PyTorch 的 MSE Loss
+            total_mse_loss += batch_mse_loss.item()
+
+            # c. MAE Loss(基于预测均值)
+            batch_mae_loss = F.l1_loss(predicted_means, targets)  # 使用 PyTorch 的 L1 Loss (MAE)
+            total_mae_loss += batch_mae_loss.item()
+
+            # 3.收集结果
+            all_true_values.append(targets.cpu().numpy())
+            all_pred_means.append(predicted_means.cpu().numpy())
+            all_pred_stds.append(predicted_stds.cpu().numpy())
+
+    # 计算平均损失
+    avg_nll_loss = total_nll_loss / total_batches
+    avg_mse_loss = total_mse_loss / total_batches
+    avg_mae_loss = total_mae_loss / total_batches
+
+    print(f"\n测试集评估完成:")
+    print(f"  平均 NLL Loss: {avg_nll_loss:.4f}")
+    print(f"  平均 MSE Loss (基于均值): {avg_mse_loss:.4f}")
+    print(f"  平均 MAE Loss (基于均值): {avg_mae_loss:.4f}")
+
+    # 将收集到的列表堆叠成 NumPy 数组
+    final_true_values = np.vstack(all_true_values)
+    final_pred_means = np.vstack(all_pred_means)
+    final_pred_stds = np.vstack(all_pred_stds)
+
+    return avg_nll_loss, avg_mse_loss, avg_mae_loss, final_true_values, final_pred_means, final_pred_stds
+
+
+# 6.结果可视化模块
+# --- 函数 1: 绘制单折预测与不确定性 ---
+def plot_prediction_uncertainty(final_true_values, final_pred_means, final_pred_stds, test_condition, freq_bands, save_dir=None):
+    """
+    绘制单个测试工况下，平均预测值、平均真实值以及预测不确定性。
+    :param final_true_values:真实值 (num_samples, num_bands)
+    :param final_pred_means:预测均值 (num_samples, num_bands)
+    :param final_pred_stds:预测标准差 (num_samples, num_bands)
+    :param test_condition:当前测试工况 (Speed, Load)
+    :param freq_bands:中心频率列表
+    :param save_dir:保存图像的目录. Defaults to None (不保存)
+    """
+    if final_true_values.ndim != 2 or final_pred_means.ndim != 2 or final_pred_stds.ndim != 2:
+        print("错误：输入数组应为二维 (samples, bands)。")
+        return
+    if len(freq_bands) != final_true_values.shape[1]:
+        print(f"错误：freq_bands 长度 ({len(freq_bands)}) 与数据维度 ({final_true_values.shape[1]}) 不匹配。")
+        return
+
+    # 计算平均值和标准差
+    avg_true = np.mean(final_true_values, axis=0)
+    avg_pred_mean = np.mean(final_pred_means, axis=0)
+    avg_pred_std = np.mean(final_pred_stds, axis=0)  # 平均预测标准差
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(freq_bands, avg_true, 'bo-', label='平均真实值 (Avg True)', markersize=4)
+    plt.plot(freq_bands, avg_pred_mean, 'rx-', label='平均预测均值 (Avg Pred Mean)', markersize=4)
+
+    # 绘制不确定性区域 (+/- 1 个平均标准差)
+    plt.fill_between(freq_bands,
+                     avg_pred_mean - avg_pred_std,
+                     avg_pred_mean + avg_pred_std,
+                     color='r', alpha=0.2, label='预测不确定性 (±1 Avg Pred Std)')
+
+    plt.xlabel("10-8000Hz三分之一倍频程中心频率 (Hz)")
+    plt.ylabel("振动加速度级 (dB)")  # 确认单位
+    plt.title(f"工况 {test_condition}：预测均值 vs 真实值")
+    plt.xticks(freq_bands, labels=[str(f) for f in freq_bands], rotation=45, ha='right')
+    plt.grid(True, which="both", ls="--", alpha=0.5)
+    plt.legend()
+    plt.tight_layout()
+
+    if save_dir:
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+        save_path = os.path.join(save_dir, f"prediction_uncertainty_cond_{test_condition[0]}_{test_condition[1]}.png")
+        plt.savefig(save_path)
+        print(f"图表已保存至: {save_path}")
+    else:
+        plt.show()
+    plt.close()  # 关闭图形，防止在循环中累积
+
+
+# --- 函数 2: 计算单折误差指标 ---
+def calculate_fold_errors(final_true_values, final_pred_means, epsilon=1e-6):
+    """
+    计算单个交叉验证折的各种误差指标
+    :param final_true_values:真实值 (num_samples, num_bands)
+    :param final_pred_means:预测均值 (num_samples, num_bands)
+    :param epsilon:用于避免除零的小常数. Defaults to 1e-6
+    :return:- np.ndarray: 每个频带的平均有符号差值 (pred - true) (shape: [num_bands,]).
+            - np.ndarray: 每个频带的平均绝对差值 |pred - true| (shape: [num_bands,]).
+            - np.ndarray: 每个频带的平均绝对相对误差 |pred - true| / |true| (shape: [num_bands,])
+    """
+    if final_true_values.shape != final_pred_means.shape:
+        raise ValueError("真实值和预测均值的形状必须匹配。")
+    if final_true_values.ndim != 2:
+        raise ValueError("输入数组必须是二维 (samples, bands)。")
+
+    # 计算差值
+    diff = final_pred_means - final_true_values
+    abs_diff = np.abs(diff)
+
+    # 计算相对误差，处理分母为零的情况
+    abs_rel_err = abs_diff / (np.abs(final_true_values)+epsilon)
+
+    # 计算每个频带的平均值
+    avg_diff_band = np.mean(diff, axis=0)
+    avg_abs_diff_band = np.mean(abs_diff, axis=0)
+    avg_rel_err_band = np.mean(abs_rel_err, axis=0)
+
+    return avg_diff_band, avg_abs_diff_band, avg_rel_err_band
+
+
+# --- 函数 3: 分析和绘制跨折误差 ---
+def analyze_and_plot_cross_fold_errors(all_errors, all_conditions, freq_bands, save_dir=None):
+    """
+    聚合所有交叉验证折的误差，并生成汇总图表
+    :param all_errors:字典，键为工况元组 (Speed, Load)，值为 calculate_fold_errors 返回的元组。
+                           e.g., {(1000, 0): (avg_diff, avg_abs_diff, avg_rel_err), ...}
+    :param all_conditions:所有唯一工况元组的列表，用于确定图表顺序
+    :param freq_bands:中心频率列表
+    :param save_dir:保存图像的目录. Defaults to None (不保存)
+    """
+    if not all_errors:
+        print("错误：'all_errors' 字典为空，无法进行分析。")
+        return
+
+    num_bands = len(freq_bands)
+    num_conditions = len(all_conditions)
+
+    # 准备数据存储
+    max_abs_diffs = []  # 每个工况的最大绝对差值 (用于柱状图)
+    avg_abs_diffs = []  # 每个工况的平均绝对差值 (用于折线图)
+    diff_matrix = np.zeros((num_conditions, num_bands))  # 有符号差值热力图数据
+    avg_rel_errors = []  # 每个工况的平均相对误差 (用于柱状图)
+    rel_err_matrix = np.zeros((num_conditions, num_bands))  # 相对误差热力图数据
+
+    condition_labels = [f"{c[0]},{c[1]}" for c in all_conditions]  # 用于绘图的标签
+
+    # 聚合数据
+    for i, condition in enumerate(all_conditions):
+        if condition not in all_errors:
+            print(f"警告：工况 {condition} 的误差数据缺失，将跳过。")
+            # 可以选择填充NaN或0，这里暂时跳过
+            max_abs_diffs.append(np.nan)
+            avg_abs_diffs.append(np.nan)
+            avg_rel_errors.append(np.nan)
+            continue
+
+        avg_diff_band, avg_abs_diff_band, avg_rel_err_band = all_errors[condition]
+
+        # 最大绝对差值、平均绝对差值数据
+        max_abs_diffs.append(np.max(avg_abs_diff_band))
+        avg_abs_diffs.append(np.mean(avg_abs_diff_band))
+
+        # 绝对差值热图数据
+        diff_matrix[i, :] = avg_diff_band
+
+        # 平均相对误差数据
+        avg_rel_errors.append(np.mean(avg_rel_err_band))
+
+        # 相对误差热图数据
+        rel_err_matrix[i, :] = avg_rel_err_band
+
+    # --- 绘图 ---
+    if save_dir and not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
+    # 图 2: 最大 & 平均绝对差值图 (柱状图 + 折线图)
+    plt.figure(figsize=(max(10, num_conditions * 0.5), 6))  # 动态调整宽度
+    bar_positions = np.arange(num_conditions)
+    plt.bar(bar_positions, max_abs_diffs, width=0.6, label='各频带最大平均绝对差值', color='skyblue')
+    plt.plot(bar_positions, avg_abs_diffs, 'ro-', label='所有频带平均绝对差值', linewidth=2, markersize=5)
+    plt.xlabel("工况 (速度, 负载)")
+    plt.ylabel("绝对差值 (dB)")  # 确认单位
+    plt.title("各工况下的最大与平均绝对预测差值")
+    plt.xticks(bar_positions, condition_labels, rotation=45, ha='right')
+    plt.legend()
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    if save_dir:
+        plt.savefig(os.path.join(save_dir, "max_avg_absolute_difference.png"))
+    else:
+        plt.show()
+    plt.close()
+
+    # 图 3: 预测偏差 (有符号差值) 热力图
+    plt.figure(figsize=(15, max(5, num_conditions * 0.3)))  # 动态调整高度
+    sns.heatmap(diff_matrix, xticklabels=[str(f) for f in freq_bands], yticklabels=condition_labels,
+                cmap="coolwarm", annot=False, fmt=".2f", center=0)  # coolwarm: 蓝负红正, center=0使0为白色
+    plt.xlabel("中心频率 (Hz)")
+    plt.ylabel("工况 (速度, 负载)")
+    plt.title("各工况各频带的平均预测偏差 (预测值 - 真实值)")
+    plt.xticks(rotation=45, ha='right')
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    if save_dir:
+        plt.savefig(os.path.join(save_dir, "signed_difference_heatmap.png"))
+    else:
+        plt.show()
+    plt.close()
+
+    # 图 4: 平均相对误差柱状图
+    plt.figure(figsize=(max(10, num_conditions * 0.5), 6))  # 动态调整宽度
+    plt.bar(bar_positions, avg_rel_errors, width=0.6, label='平均相对误差', color='lightcoral')
+    plt.xlabel("工况 (速度, 负载)")
+    plt.ylabel("平均相对误差")
+    plt.title("各工况下的平均相对预测误差")
+    plt.xticks(bar_positions, condition_labels, rotation=45, ha='right')
+    # plt.legend() # 如果只有一个bar，可以不用图例
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    if save_dir:
+        plt.savefig(os.path.join(save_dir, "average_relative_error_bar.png"))
+    else:
+        plt.show()
+    plt.close()
+
+    # 图 5: 平均相对误差热力图
+    plt.figure(figsize=(15, max(5, num_conditions * 0.3)))  # 动态调整高度
+    sns.heatmap(rel_err_matrix, xticklabels=[str(f) for f in freq_bands], yticklabels=condition_labels,
+                cmap="viridis", annot=False, fmt=".2f")  # viridis: 常见的表示大小的热图颜色
+    plt.xlabel("中心频率 (Hz)")
+    plt.ylabel("工况 (速度, 负载)")
+    plt.title("各工况各频带的平均相对预测误差")
+    plt.xticks(rotation=45, ha='right')
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    if save_dir:
+        plt.savefig(os.path.join(save_dir, "relative_error_heatmap.png"))
+    else:
+        plt.show()
+    plt.close()
+
+    print("跨折误差分析和绘图完成")
+
+
+# 主程序入口
+if __name__ == "__main__":
+    # ---设备设置---
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"当前使用设备：{device}")
+
+    # ---保存路径设置---
+    PLOT_SAVE_DIR = "analysis_and_plots"
+    if not os.path.exists(PLOT_SAVE_DIR):
+        os.makedirs(PLOT_SAVE_DIR)
+        print(f"创建绘图保存目录：{PLOT_SAVE_DIR}")
+
+    # ---1. 数据加载---
+    print("开始加载数据...")
+    data = load_data(DATASET_PATH)
+    print(f"数据加载完成，形状：{data.shape}")
+
+    # 获取所有唯一工况，用于后续绘图和确保顺序一致
+    all_conditions_list = sorted(data[["speed", "load"]].drop_duplicates().values.tolist())
+    all_conditions_list = [tuple(c) for c in all_conditions_list]  # 确保是元组列表
+    print(f"发现{len(all_conditions_list)}个唯一工况：{all_conditions_list}")
+
+    # ---2. 初始化结果存储---
+    all_fold_errors_results = {}  # 用于存储每个测试工况折的误差指标
+    all_fold_test_metrics = {}  # 存储每个折的测试集 NLL, MSE, MAE
+
+    # ---3. 创建数据预处理生成器---
+    # preprocess_data 的第二个参数 test_condition 在其内部循环中使用，这里传递 None
+    data_generator = preprocess_data(data, test_condition=None)
+
+    # ---4.交叉验证循环---
+    fold_counter = 0
+    for fold_data in data_generator:
+        fold_counter += 1
+        # 解包当前折的数据
+        X_train, y_train, X_val, y_val, X_test, y_test, scaler, current_test_condition, current_val_condition = fold_data
+
+        print(f"\n===== 开始 Fold {fold_counter} (Test: {current_test_condition}, Val: {current_val_condition}) =====")
+
+        # ---4.1 创建 DataLoaders---
+        try:
+            train_loader, test_loader, val_loader = create_dataloaders(
+                X_train, y_train, X_test, y_test, X_val, y_val, BATCH_SIZE
+            )
+            print(
+                f"  DataLoaders 创建成功: Train batches={len(train_loader)}, Val batches={len(val_loader)}, Test batches={len(test_loader)}")
+        except Exception as e:
+            print(f"  错误：创建 DataLoaders 失败: {e}。跳过此 Fold。")
+            continue
+
+        # ---4.2 实例化模型 (为每个 fold 重新实例化)---
+        input_dim = X_train.shape[1]
+        output_dim = y_train.shape[1]
+        if output_dim != num_bands:  # 验证维度匹配
+            print(f"  错误：数据标签维度 ({output_dim}) 与 freq_bands 长度 ({num_bands}) 不匹配。跳过此 Fold。")
+            continue
+        model = FrequencyAwareProbabilisticMultiTaskModel(input_dim, output_dim, LOW_FREQ_THRESHOLD).to(device)
+        print(f"  模型实例化成功: Input dim={input_dim}, Output dim={output_dim}, Low Freq Thresh={LOW_FREQ_THRESHOLD}")
+
+        # ---4.3 准备优化器和损失函数---
+        try:
+            optimizer, scheduler, adaptive_loss, nll_loss = prepare_optimizer_and_loss(
+                model, output_dim, device
+            )
+        except Exception as e:
+            print(f"  错误：准备优化器和损失函数失败: {e}。跳过此 Fold。")
+            continue
+
+        # ---4.4 训练模型---
+        try:
+            train_history, val_history, best_val_loss, best_weights, per_task_history = train_model(
+                model=model,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                adaptive_loss_func=adaptive_loss,
+                nll_loss_func=nll_loss,  # 传递 nll_loss 实例
+                l2_lambda=L2_LAMBDA,
+                num_epochs=NUM_EPOCHS,
+                patience=PATIENCE,
+                device=device
+            )
+            print(f"--- Fold {fold_counter} 训练完成 ---")
+            print(f"  最佳验证 NLL Loss: {best_val_loss:.4f}")
+            if best_weights is None:
+                print("  警告：未能找到最佳模型权重，评估将使用最后一轮的权重。")
+                # 如果需要，可以在这里决定是否跳过评估
+        except Exception as e:
+            print(f"  错误：模型训练过程中发生错误: {e}。跳过此 Fold 的后续步骤。")
+            continue  # 跳到下一个 fold
+
+        # ---4.5 评估模型 (在测试集上)---
+        # train_model 函数结束时已经加载了最佳权重 (如果找到)
+        try:
+            avg_nll, avg_mse, avg_mae, true_vals_test, pred_means_test, pred_stds_test = evaluate_model(
+                model,
+                test_loader,
+                nll_loss,  # 传递 nll_loss 实例
+                device
+            )
+            # 存储测试指标
+            all_fold_test_metrics[current_test_condition] = {'NLL': avg_nll, 'MSE': avg_mse, 'MAE': avg_mae}
+
+        except Exception as e:
+            print(f"  错误：模型评估过程中发生错误: {e}。跳过此 Fold 的后续分析。")
+            continue  # 跳到下一个 fold
+
+        # ---4.6 单折分析与绘图---
+        # 定义当前折的绘图保存子目录
+        fold_save_dir = os.path.join(PLOT_SAVE_DIR, f"fold_test_{current_test_condition[0]}_{current_test_condition[1]}")
+
+        # 4.6.1 绘制预测不确定性图
+        try:
+            plot_prediction_uncertainty(
+                final_true_values=true_vals_test,  # 函数内部变量名是 final_...
+                final_pred_means=pred_means_test,
+                final_pred_stds=pred_stds_test,
+                test_condition=current_test_condition,
+                freq_bands=freq_bands,
+                save_dir=fold_save_dir  # 指定保存目录
+            )
+        except Exception as e:
+            print(f"  错误：绘制预测不确定性图失败: {e}")
+
+        # 4.6.2 计算当前折的误差指标
+        try:
+            avg_diff, avg_abs_diff, avg_rel_err = calculate_fold_errors(
+                final_true_values=true_vals_test,  # 函数内部变量名是 final_...
+                final_pred_means=pred_means_test
+            )
+        except Exception as e:
+            print(f"  错误：计算误差指标失败: {e}。无法为跨折分析存储此 Fold 数据。")
+            continue  # 跳到下一个 fold
+
+        # 4.6.3 存储当前折的误差结果，用于后续跨折分析
+        all_fold_errors_results[current_test_condition] = (avg_diff, avg_abs_diff, avg_rel_err)
+        print(f"  Fold {fold_counter} 的误差指标已计算并存储。")
+
+        print(f"===== Fold {fold_counter} 处理完成 =====")
+
+        # break # 如果只想运行一个 fold 用于测试，取消此行注释
+
+    # ---5.交叉验证循环结束后---
+    print("\n===== 所有 Fold 完成，开始进行跨 Fold 误差分析 =====")
+
+    if not all_fold_errors_results:
+        print("没有收集到任何 Fold 的误差结果，无法进行跨 Fold 分析。")
+    else:
+        try:
+            # 调用跨折分析与绘图函数
+            analyze_and_plot_cross_fold_errors(
+                all_errors=all_fold_errors_results,
+                all_conditions=all_conditions_list,  # 传入所有工况列表
+                freq_bands=freq_bands,
+                save_dir=PLOT_SAVE_DIR  # 指定主保存目录
+            )
+        except Exception as e:
+            print(f"  错误：执行跨 Fold 分析和绘图时发生错误: {e}")
+
+    # ---6.打印所有折的平均测试指标---
+    if all_fold_test_metrics:
+        print("\n===== 各 Fold 测试集平均指标总结 =====")
+        avg_test_nll = np.mean([m['NLL'] for m in all_fold_test_metrics.values()])
+        avg_test_mse = np.mean([m['MSE'] for m in all_fold_test_metrics.values()])
+        avg_test_mae = np.mean([m['MAE'] for m in all_fold_test_metrics.values()])
+        print(f"  平均测试 NLL Loss (跨 Fold): {avg_test_nll:.4f}")
+        print(f"  平均测试 MSE Loss (跨 Fold): {avg_test_mse:.4f}")
+        print(f"  平均测试 MAE Loss (跨 Fold): {avg_test_mae:.4f}")
+        # 也可以打印每个 fold 的指标
+        for cond, metrics in all_fold_test_metrics.items():
+           print(f"  工况 {cond}: NLL={metrics['NLL']:.4f}, MSE={metrics['MSE']:.4f}, MAE={metrics['MAE']:.4f}")
+
+    print("\n===== 分析脚本执行完毕 =====")
