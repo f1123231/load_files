@@ -1,0 +1,219 @@
+当前使用设备：cpu
+开始加载数据...
+数据加载完成，形状：(1025, 33)
+发现25个唯一工况：[(1000, 0), (1000, 20), (1000, 40), (1000, 60), (1500, 0), (1500, 20), (1500, 40), (1500, 60), (1797, 0), (1800, 0), (1800, 20), (1800, 40), (1800, 60), (2000, 0), (2000, 20), (2000, 40), (2000, 60), (2500, 0), (2500, 20), (2500, 40), (2500, 60), (3000, 0), (3000, 20), (3000, 40), (3000, 60)]
+
+===== 开始留一工况交叉验证 =====
+数据预处理开始...
+只保留需要的列后的data的形状：(1025, 32)
+总共发现 25 个独立工况: [(1000, 0), (1000, 20), (1000, 40), (1000, 60), (1500, 0), (1500, 20), (1500, 40), (1500, 60), (1797, 0), (1800, 0), (1800, 20), (1800, 40), (1800, 60), (2000, 0), (2000, 20), (2000, 40), (2000, 60), (2500, 0), (2500, 20), (2500, 40), (2500, 60), (3000, 0), (3000, 20), (3000, 40), (3000, 60)]
+
+--- 外层循环：指定测试工况为 (1000, 0) ---
+测试工况 (1000, 0) 的样本数: 41
+用于划分训练+验证的剩余工况样本总数: 984
+  --- 内层循环：指定验证工况为 (1000, 20) ---
+验证工况 (1000, 20) 的样本数: 41
+训练集包含的工况数: 23, 样本数: 943
+对当前训练集进行数据清洗...
+  训练 数据形状(缺失值处理后): (943, 32)
+  训练 数据形状(异常值处理后)：(943, 32)
+对当前验证集进行数据清洗...
+  验证 数据形状(缺失值处理后): (41, 32)
+  验证 数据形状(异常值处理后)：(41, 32)
+对当前测试集进行数据清洗...
+  测试 数据形状(缺失值处理后): (41, 32)
+  测试 数据形状(异常值处理后)：(41, 32)
+
+--- 第 1 折 / 25 ---
+  测试工况: (1000, 0), 验证工况: (1000, 20)
+  训练集大小: 943, 验证集大小: 41, 测试集大小: 41
+  数据加载器创建完成。
+  模型 FrequencyAwareProbabilisticMultiTaskModel 初始化完成。输入维度: 2, 输出维度: 30
+准备优化器和损失函数...
+- 自适应损失函数 (FrequencyAwareAdaptiveWeightLoss) 创建成功，低频阈值: 6, 低频增强: 2.0
+  - 主损失函数 (GaussianNLLLoss, reduction='none') 创建成功。
+  - 参数分组：共享层 10 个参数张量，低频特定层 56 个，高频特定层 152 个，自适应损失 1 个。
+D:\Anaconda\Lib\site-packages\torch\optim\lr_scheduler.py:28: UserWarning: The verbose parameter is deprecated. Please use get_last_lr() to access the learning rate.
+  warnings.warn("The verbose parameter is deprecated. Please use get_last_lr() "
+  - Adam 优化器创建成功。基础 LR: 0.0005, 低频 LR: 0.001, 高频 LR: 0.0005, 自适应损失 LR: 0.01, Weight Decay: 1e-05
+  - ReduceLROnPlateau 学习率调度器创建成功。Factor: 0.5, Patience: 10
+优化器和损失函数准备完毕。
+
+  开始训练...
+开始训练模型，共300个epochs，早停耐心设置为15...
+Epoch [1/300], Train Loss: 1.7547, Val NLL Loss: 2.5534
+  Validation loss 改善，保存当前最佳模型。
+Epoch [2/300], Train Loss: 1.3469, Val NLL Loss: 1.8995
+  Validation loss 改善，保存当前最佳模型。
+Epoch [3/300], Train Loss: 1.1164, Val NLL Loss: 1.8586
+  Validation loss 改善，保存当前最佳模型。
+Epoch [4/300], Train Loss: 0.9949, Val NLL Loss: 1.6881
+  Validation loss 改善，保存当前最佳模型。
+Epoch [5/300], Train Loss: 0.8746, Val NLL Loss: 1.4411
+  Validation loss 改善，保存当前最佳模型。
+Epoch [6/300], Train Loss: 0.7865, Val NLL Loss: 1.4944
+  Validation loss 未改善 (1/15).
+Epoch [7/300], Train Loss: 0.7114, Val NLL Loss: 1.7324
+  Validation loss 未改善 (2/15).
+Epoch [8/300], Train Loss: 0.6137, Val NLL Loss: 2.4554
+  Validation loss 未改善 (3/15).
+Epoch [9/300], Train Loss: 0.5156, Val NLL Loss: 2.8218
+  Validation loss 未改善 (4/15).
+Epoch [10/300], Train Loss: 0.3816, Val NLL Loss: 2.9691
+  Validation loss 未改善 (5/15).
+Epoch [11/300], Train Loss: 0.2307, Val NLL Loss: 2.6454
+  Validation loss 未改善 (6/15).
+Epoch [12/300], Train Loss: 0.0091, Val NLL Loss: 3.2132
+  Validation loss 未改善 (7/15).
+Epoch [13/300], Train Loss: -0.4665, Val NLL Loss: 3.8181
+  Validation loss 未改善 (8/15).
+Epoch [14/300], Train Loss: -1.6101, Val NLL Loss: 3.3746
+  Validation loss 未改善 (9/15).
+Epoch [15/300], Train Loss: -5.0283, Val NLL Loss: 2.7461
+  Validation loss 未改善 (10/15).
+Epoch [16/300], Train Loss: -7.6110, Val NLL Loss: 3.1888
+  Validation loss 未改善 (11/15).
+Epoch [17/300], Train Loss: -31.8590, Val NLL Loss: 3.5788
+  Validation loss 未改善 (12/15).
+Epoch [18/300], Train Loss: -50.6329, Val NLL Loss: 3.7194
+  Validation loss 未改善 (13/15).
+Epoch [19/300], Train Loss: -85.4998, Val NLL Loss: 3.3867
+  Validation loss 未改善 (14/15).
+Epoch [20/300], Train Loss: -140.7712, Val NLL Loss: 3.2064
+  Validation loss 未改善 (15/15).
+
+早停触发：验证损失连续 15 epochs 未改善。停止训练于 epoch 20。
+
+训练结束。加载验证损失最小 (NLL Loss: 1.4411) 时的模型权重。
+  已加载最佳模型权重 (验证 NLL Loss: 1.4411)。
+  开始评估...
+开始在测试集上评估模型...
+
+测试集评估完成:
+  平均 NLL Loss (标准化尺度): 3.8504
+  平均 MSE Loss (原始尺度): 28.7342
+  平均 MAE Loss (原始尺度): 4.6573
+  测试工况 (1000, 0) 评估指标已记录。
+  测试工况 (1000, 0) 误差分析结果已记录。
+图表已保存至: analysis_and_plots\prediction_uncertainty_cond_1000_0.png
+  --- 内层循环：指定验证工况为 (1000, 40) ---
+验证工况 (1000, 40) 的样本数: 41
+训练集包含的工况数: 23, 样本数: 943
+对当前训练集进行数据清洗...
+  训练 数据形状(缺失值处理后): (943, 32)
+  训练 数据形状(异常值处理后)：(943, 32)
+对当前验证集进行数据清洗...
+  验证 数据形状(缺失值处理后): (41, 32)
+  验证 数据形状(异常值处理后)：(41, 32)
+对当前测试集进行数据清洗...
+  测试 数据形状(缺失值处理后): (41, 32)
+  测试 数据形状(异常值处理后)：(41, 32)
+
+--- 第 2 折 / 25 ---
+  测试工况: (1000, 0), 验证工况: (1000, 40)
+  训练集大小: 943, 验证集大小: 41, 测试集大小: 41
+  数据加载器创建完成。
+D:\Anaconda\Lib\site-packages\torch\optim\lr_scheduler.py:28: UserWarning: The verbose parameter is deprecated. Please use get_last_lr() to access the learning rate.
+  warnings.warn("The verbose parameter is deprecated. Please use get_last_lr() "
+  模型 FrequencyAwareProbabilisticMultiTaskModel 初始化完成。输入维度: 2, 输出维度: 30
+准备优化器和损失函数...
+- 自适应损失函数 (FrequencyAwareAdaptiveWeightLoss) 创建成功，低频阈值: 6, 低频增强: 2.0
+  - 主损失函数 (GaussianNLLLoss, reduction='none') 创建成功。
+  - 参数分组：共享层 10 个参数张量，低频特定层 56 个，高频特定层 152 个，自适应损失 1 个。
+  - Adam 优化器创建成功。基础 LR: 0.0005, 低频 LR: 0.001, 高频 LR: 0.0005, 自适应损失 LR: 0.01, Weight Decay: 1e-05
+  - ReduceLROnPlateau 学习率调度器创建成功。Factor: 0.5, Patience: 10
+优化器和损失函数准备完毕。
+
+  开始训练...
+开始训练模型，共300个epochs，早停耐心设置为15...
+Epoch [1/300], Train Loss: 1.7638, Val NLL Loss: 1.9285
+  Validation loss 改善，保存当前最佳模型。
+Epoch [2/300], Train Loss: 1.3655, Val NLL Loss: 1.6049
+  Validation loss 改善，保存当前最佳模型。
+Epoch [3/300], Train Loss: 1.1173, Val NLL Loss: 1.1398
+  Validation loss 改善，保存当前最佳模型。
+Epoch [4/300], Train Loss: 0.9502, Val NLL Loss: 0.8969
+  Validation loss 改善，保存当前最佳模型。
+Epoch [5/300], Train Loss: 0.8336, Val NLL Loss: 0.7251
+  Validation loss 改善，保存当前最佳模型。
+Epoch [6/300], Train Loss: 0.7472, Val NLL Loss: 0.5482
+  Validation loss 改善，保存当前最佳模型。
+Epoch [7/300], Train Loss: 0.6656, Val NLL Loss: 0.3900
+  Validation loss 改善，保存当前最佳模型。
+Epoch [8/300], Train Loss: 0.5595, Val NLL Loss: 0.3050
+  Validation loss 改善，保存当前最佳模型。
+Epoch [9/300], Train Loss: 0.4558, Val NLL Loss: 0.2677
+  Validation loss 改善，保存当前最佳模型。
+Epoch [10/300], Train Loss: 0.3330, Val NLL Loss: 0.5071
+  Validation loss 未改善 (1/15).
+Epoch [11/300], Train Loss: 0.1776, Val NLL Loss: 0.3631
+  Validation loss 未改善 (2/15).
+Epoch [12/300], Train Loss: -0.1246, Val NLL Loss: 0.4027
+  Validation loss 未改善 (3/15).
+Epoch [13/300], Train Loss: -0.6216, Val NLL Loss: 0.5287
+  Validation loss 未改善 (4/15).
+Epoch [14/300], Train Loss: -1.2426, Val NLL Loss: 1.1032
+  Validation loss 未改善 (5/15).
+Epoch [15/300], Train Loss: -3.5433, Val NLL Loss: 0.4668
+  Validation loss 未改善 (6/15).
+Epoch [16/300], Train Loss: -7.5583, Val NLL Loss: 0.3981
+  Validation loss 未改善 (7/15).
+Epoch [17/300], Train Loss: -22.6425, Val NLL Loss: 0.1761
+  Validation loss 改善，保存当前最佳模型。
+Epoch [18/300], Train Loss: -67.9469, Val NLL Loss: 0.2932
+  Validation loss 未改善 (1/15).
+Epoch [19/300], Train Loss: -153.0274, Val NLL Loss: 0.2426
+  Validation loss 未改善 (2/15).
+Epoch [20/300], Train Loss: -543.9233, Val NLL Loss: 0.3973
+  Validation loss 未改善 (3/15).
+Epoch [21/300], Train Loss: -2061.7047, Val NLL Loss: 1.8527
+  Validation loss 未改善 (4/15).
+Epoch [22/300], Train Loss: -6168.3648, Val NLL Loss: 1.0527
+  Validation loss 未改善 (5/15).
+Epoch [23/300], Train Loss: -20716.2663, Val NLL Loss: 0.2243
+  Validation loss 未改善 (6/15).
+Epoch [24/300], Train Loss: -83033.1990, Val NLL Loss: 0.3692
+  Validation loss 未改善 (7/15).
+Epoch [25/300], Train Loss: -270540.6974, Val NLL Loss: 0.2897
+  Validation loss 未改善 (8/15).
+Epoch [26/300], Train Loss: -1091066.8964, Val NLL Loss: 0.3413
+  Validation loss 未改善 (9/15).
+Epoch [27/300], Train Loss: -3419150.2958, Val NLL Loss: 1.1511
+  Validation loss 未改善 (10/15).
+Epoch [28/300], Train Loss: -17492217.4917, Val NLL Loss: 0.2929
+  Validation loss 未改善 (11/15).
+Epoch [29/300], Train Loss: -49277413.8000, Val NLL Loss: 0.3694
+  Validation loss 未改善 (12/15).
+Epoch [30/300], Train Loss: -104518200.9333, Val NLL Loss: 0.3499
+  Validation loss 未改善 (13/15).
+Epoch [31/300], Train Loss: -193517888.1667, Val NLL Loss: 0.3614
+  Validation loss 未改善 (14/15).
+Epoch [32/300], Train Loss: -395680456.5333, Val NLL Loss: 0.3680
+  Validation loss 未改善 (15/15).
+
+早停触发：验证损失连续 15 epochs 未改善。停止训练于 epoch 32。
+
+训练结束。加载验证损失最小 (NLL Loss: 0.1761) 时的模型权重。
+  已加载最佳模型权重 (验证 NLL Loss: 0.1761)。
+  开始评估...
+开始在测试集上评估模型...
+
+测试集评估完成:
+  平均 NLL Loss (标准化尺度): 5.8334
+  平均 MSE Loss (原始尺度): 13.7416
+  平均 MAE Loss (原始尺度): 2.9574
+  测试工况 (1000, 0) 评估指标已记录。
+  测试工况 (1000, 0) 误差分析结果已记录。
+图表已保存至: analysis_and_plots\prediction_uncertainty_cond_1000_0.png
+  --- 内层循环：指定验证工况为 (1000, 60) ---
+验证工况 (1000, 60) 的样本数: 41
+训练集包含的工况数: 23, 样本数: 943
+对当前训练集进行数据清洗...
+  训练 数据形状(缺失值处理后): (943, 32)
+  训练 数据形状(异常值处理后)：(943, 32)
+对当前验证集进行数据清洗...
+  验证 数据形状(缺失值处理后): (41, 32)
+  验证 数据形状(异常值处理后)：(41, 32)
+对当前测试集进行数据清洗...
+  测试 数据形状(缺失值处理后): (41, 32)
+  测试 数据形状(异常值处理后)：(41, 32)
